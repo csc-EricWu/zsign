@@ -55,7 +55,11 @@ public:
 	uint32_t		m_uFileType;
 	mach_header*	m_pHeader;
 	uint32_t		m_uHeaderSize;
+	// CodeDirectory 页大小的 log2（12=4KB，14=16KB）；影响相同 codeLimit 下的 nCodeSlots 数量。
+	uint8_t			m_uCodeSignPageLog2;
 
 private:
 	static uint64_t s_uExecSegLimit;
+	// 推断页大小：重签时优先沿用已有 CD；否则按 segment 文件偏移是否 16KB 对齐推断。
+	static uint8_t InferCodeSignPageLog2(uint8_t* pBase, uint32_t uHeaderSize, uint32_t ncmds, bool b64Bit, bool bBigEndian, uint8_t* pCSBase);
 };

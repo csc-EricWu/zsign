@@ -5,11 +5,74 @@
 
 uint64_t ZArchO::s_uExecSegLimit = 0;
 
+// 推断 CodeDirectory 的 pageSize（log2）。App Store / 新版 arm64 常用 16KB 页（14），旧版 zsign 写死 4KB（12）。
+// 页大小错误会导致 code slot 数量与 codesign 不一致，altool 报「未使用提交证书」等 409。
+// 段对齐启发式与常见 Mach-O 工具一致：所有非零 fileoff 均为 0x4000 对齐时用 16KB。
+uint8_t ZArchO::InferCodeSignPageLog2(uint8_t* pBase, uint32_t uHeaderSize, uint32_t ncmds, bool b64Bit, bool bBigEndian, uint8_t* pCSBase)
+{
+	auto BO32 = [bBigEndian](uint32_t uVal) -> uint32_t {
+		return bBigEndian ? LE(uVal) : uVal;
+	};
+
+	// 重签已有二进制时，优先沿用嵌入签名里已有 CodeDirectory 的 pageSize。
+	if (NULL != pCSBase && CSMAGIC_EMBEDDED_SIGNATURE == LE(((CS_SuperBlob*)pCSBase)->magic)) {
+		CS_SuperBlob* psb = (CS_SuperBlob*)pCSBase;
+		CS_BlobIndex* pbi = (CS_BlobIndex*)(pCSBase + sizeof(CS_SuperBlob));
+		for (uint32_t i = 0; i < LE(psb->count); i++, pbi++) {
+			if (CSSLOT_CODEDIRECTORY != LE(pbi->type)) {
+				continue;
+			}
+			uint8_t* pSlot = pCSBase + LE(pbi->offset);
+			if (CSMAGIC_CODEDIRECTORY == LE(((uint32_t*)pSlot)[0])) {
+				CS_CodeDirectory* pcd = (CS_CodeDirectory*)pSlot;
+				if (pcd->pageSize > 0 && pcd->pageSize <= 16) {
+					return pcd->pageSize;
+				}
+			}
+		}
+	}
+
+	bool bAll16KAligned = true;
+	bool bHasSegmentOffset = false;
+	uint8_t* pLoadCommand = pBase + uHeaderSize;
+	for (uint32_t i = 0; i < ncmds; i++) {
+		load_command* plc = (load_command*)pLoadCommand;
+		uint32_t uCmd = BO32(plc->cmd);
+		if (LC_SEGMENT == uCmd) {
+			segment_command* seglc = (segment_command*)pLoadCommand;
+			uint32_t uFileOff = BO32(seglc->fileoff);
+			if (uFileOff > 0) {
+				bHasSegmentOffset = true;
+				if (0 != (uFileOff % 16384)) {
+					bAll16KAligned = false;
+				}
+			}
+		} else if (LC_SEGMENT_64 == uCmd) {
+			segment_command_64* seglc = (segment_command_64*)pLoadCommand;
+			uint64_t uFileOff64 = bBigEndian ? LE(seglc->fileoff) : seglc->fileoff;
+			uint32_t uFileOff = (uint32_t)uFileOff64;
+			if (uFileOff > 0) {
+				bHasSegmentOffset = true;
+				if (0 != (uFileOff % 16384)) {
+					bAll16KAligned = false;
+				}
+			}
+		}
+		pLoadCommand += BO32(plc->cmdsize);
+	}
+
+	if (bHasSegmentOffset && bAll16KAligned) {
+		return 14; // 2^14 = 16384 字节/页
+	}
+	return 12; // 2^12 = 4096 字节/页（默认）
+}
+
 ZArchO::ZArchO()
 {
 	m_pBase = NULL;
 	m_uLength = 0;
 	m_uCodeLength = 0;
+	m_uCodeSignPageLog2 = 12;
 	m_pSignBase = NULL;
 	m_uSignLength = 0;
 	m_pHeader = NULL;
@@ -109,6 +172,14 @@ bool ZArchO::Init(uint8_t* pBase, uint32_t uLength)
 
 		pLoadCommand += BO(plc->cmdsize);
 	}
+
+	m_uCodeSignPageLog2 = InferCodeSignPageLog2(
+		m_pBase,
+		m_uHeaderSize,
+		BO(m_pHeader->ncmds),
+		m_b64Bit,
+		m_bBigEndian,
+		m_pSignBase);
 
 	return true;
 }
@@ -389,9 +460,16 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 		uExecSegFlags |= CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED;
 	}
 
+	// App Store 上传要求仅保留 SHA-256 CodeDirectory（与 codesign / -2 一致）。
+	// Apple Distribution 证书自动启用；若命令行已传 -2 则不再覆盖。
+	bool bSHA256Only = pSignAsset->m_bSHA256Only;
+	if (!bSHA256Only && NULL != strstr(pSignAsset->m_strSubjectCN.c_str(), "Distribution")) {
+		bSHA256Only = true;
+	}
+
 	string strCodeDirectorySlot;
 	string strAltnateCodeDirectorySlot;
-	if (!pSignAsset->m_bSHA256Only) {
+	if (!bSHA256Only) {
 		ZSign::SlotBuildCodeDirectory(false,
 			m_pBase,
 			m_uCodeLength,
@@ -408,6 +486,7 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 			strDerEntitlementsSlotSHA1,
 			IsExecute(),
 			pSignAsset->m_bAdhoc,
+			m_uCodeSignPageLog2,
 			strCodeDirectorySlot);
 	}
 
@@ -427,8 +506,9 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 		strDerEntitlementsSlotSHA256,
 		IsExecute(),
 		pSignAsset->m_bAdhoc,
+		m_uCodeSignPageLog2,
 		strAltnateCodeDirectorySlot);
-	if (pSignAsset->m_bSHA256Only) {
+	if (bSHA256Only) {
 		// SHA256-based code directory is usually the alternate; however, make it the primary (and only)
 		// code directory if `m_bUseSHA256Only == true`.
 		strAltnateCodeDirectorySlot.swap(strCodeDirectorySlot);

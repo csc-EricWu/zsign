@@ -82,6 +82,74 @@ cd zsign/build/linux
 make clean && make
 ```
 
+**CentOS 7 / RHEL 7 等系统 OpenSSL 1.0.x**
+
+zsign 依赖 OpenSSL 3.0+（需要 `<openssl/provider.h>`）。CentOS 7 等发行版自带的 `openssl-devel` 为 1.0.2，直接 `make` 会报错：
+
+```
+openssl/provider.h: 没有那个文件或目录
+```
+
+建议将 OpenSSL 3 安装到独立目录 `/usr/local/openssl3`，**不替换**系统自带的 OpenSSL 1.0.2（避免影响宝塔、Nginx 等依赖旧版 OpenSSL 的服务）。
+
+**1. 安装编译依赖**
+
+```bash
+sudo yum install -y perl-core zlib-devel gcc-c++ make wget tar
+```
+
+**2. 编译安装 OpenSSL 3.0.15**
+
+```bash
+cd /tmp
+wget https://www.openssl.org/source/openssl-3.0.15.tar.gz
+# 若官方下载失败，可改用 GitHub 镜像：
+# wget https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz
+
+tar xzf openssl-3.0.15.tar.gz
+cd openssl-3.0.15
+./Configure linux-x86_64 --prefix=/usr/local/openssl3 --openssldir=/usr/local/openssl3 shared
+make -j$(nproc)
+sudo make install_sw install_ssldirs
+```
+
+验证安装：
+
+```bash
+export LD_LIBRARY_PATH=/usr/local/openssl3/lib64:$LD_LIBRARY_PATH
+/usr/local/openssl3/bin/openssl version
+# 应输出：OpenSSL 3.0.15 ...
+test -f /usr/local/openssl3/include/openssl/provider.h && echo "provider.h OK"
+```
+
+**3. 使用 OpenSSL 3 编译 zsign**
+
+```bash
+git clone https://github.com/zhlynn/zsign.git
+cd zsign/build/linux
+make clean && make \
+  OPENSSL_INCLUDE="-I/usr/local/openssl3/include" \
+  OPENSSL_LIB="-L/usr/local/openssl3/lib64 -Wl,-rpath,/usr/local/openssl3/lib64 -lssl -lcrypto -ldl -pthread"
+```
+
+编译成功后，二进制位于 `../../bin/zsign`，已嵌入 `rpath`，运行时无需额外设置 `LD_LIBRARY_PATH`。
+
+**4. 可选：后续编译简化**
+
+设置 `pkg-config` 路径后可直接 `make`：
+
+```bash
+export PKG_CONFIG_PATH=/usr/local/openssl3/lib64/pkgconfig
+make clean && make
+```
+
+或写入 `/etc/ld.so.conf.d/openssl3.conf` 使 OpenSSL 3 命令行工具全局可用（不影响 `/usr/bin/openssl`）：
+
+```bash
+echo "/usr/local/openssl3/lib64" | sudo tee /etc/ld.so.conf.d/openssl3.conf
+sudo ldconfig
+```
+
 ### Windows
 
 使用 Visual Studio 2022 打开 `build/windows/vs2022/zsign.sln` 进行构建。

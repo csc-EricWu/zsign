@@ -25,6 +25,7 @@ public:
 										const string& strDerEntitlementsSlotSHA,
 										bool isExecuteArch,
 										bool isAdhoc,
+										uint8_t uPageSizeLog2, // CS_CodeDirectory.pageSize：每页字节数的 log2
 										string& strOutput);
 	
 	static bool SlotBuildCMSSignature(ZSignAsset* pSignAsset,

@@ -445,6 +445,7 @@ bool ZSign::SlotBuildCodeDirectory(bool bAlternate,
 	const string& strDerEntitlementsSlotSHA,
 	bool isExecuteArch,
 	bool isAdhoc,
+	uint8_t uPageSizeLog2,
 	string& strOutput)
 {
 	strOutput.clear();
@@ -468,7 +469,8 @@ bool ZSign::SlotBuildCodeDirectory(bool bAlternate,
 	cdHeader.hashSize = bAlternate ? 32 : 20;
 	cdHeader.hashType = bAlternate ? 2 : 1;
 	cdHeader.spare1 = 0;
-	cdHeader.pageSize = 12;
+	// 旧实现写死 12（4KB）；arm64 App Store 包通常需 14（16KB），见 ZArchO::InferCodeSignPageLog2。
+	cdHeader.pageSize = (uPageSizeLog2 > 0 && uPageSizeLog2 <= 16) ? uPageSizeLog2 : 12;
 	cdHeader.spare2 = 0;
 	cdHeader.scatterOffset = 0;
 	cdHeader.teamOffset = 0;
@@ -650,6 +652,54 @@ bool ZSign::SlotParseCMSSignature(uint8_t* pSlotBase, CS_BlobIndex* pbi)
 	return true;
 }
 
+// 计算 cdhash 时只取 CodeDirectory.length 指定长度，不能包含缓冲区尾部多余字节。
+static bool CodeDirectoryBlobSlice(const string& strCodeDirectorySlot, string& strSlice)
+{
+	strSlice.clear();
+	if (strCodeDirectorySlot.size() < 8) {
+		return false;
+	}
+	uint32_t uLength = LE(*((const uint32_t*)(strCodeDirectorySlot.data() + 4)));
+	if (uLength < 8 || uLength > strCodeDirectorySlot.size()) {
+		return false;
+	}
+	strSlice.assign(strCodeDirectorySlot.data(), uLength);
+	return true;
+}
+
+// CMS 属性 1.2.840.113635.100.9.1（cdhashes plist）：对 CD blob 做哈希后取前 20 字节。
+// 与 codesign 的 CandidateCDHash / CDHash 一致（SHA-256 目录同样截断为 20 字节）。
+static bool ComputeCdHash20(const string& strCodeDirectorySlot, bool bUseSHA256, string& strCdHash20)
+{
+	strCdHash20.clear();
+	string strSlice;
+	if (!CodeDirectoryBlobSlice(strCodeDirectorySlot, strSlice)) {
+		return false;
+	}
+	string strFullHash;
+	if (bUseSHA256) {
+		ZSHA::SHA256(strSlice, strFullHash);
+	} else {
+		ZSHA::SHA1(strSlice, strFullHash);
+	}
+	if (strFullHash.size() < 20) {
+		return false;
+	}
+	strCdHash20.assign(strFullHash.data(), 20);
+	return true;
+}
+
+// CMS 属性 1.2.840.113635.100.9.2（CDHashes2）：CD blob 的完整 32 字节 SHA-256。
+static bool ComputeCdHashFull256(const string& strCodeDirectorySlot, string& strCdHash256)
+{
+	strCdHash256.clear();
+	string strSlice;
+	if (!CodeDirectoryBlobSlice(strCodeDirectorySlot, strSlice)) {
+		return false;
+	}
+	return ZSHA::SHA256(strSlice, strCdHash256) && strCdHash256.size() == 32;
+}
+
 bool ZSign::SlotBuildCMSSignature(ZSignAsset* pSignAsset,
 	const string& strCodeDirectorySlot,
 	const string& strAltnateCodeDirectorySlot,
@@ -662,20 +712,37 @@ bool ZSign::SlotBuildCMSSignature(ZSignAsset* pSignAsset,
 		return true;
 	}
 
+	// 分离式 CMS 正文必须是 SHA-256 CodeDirectory（存在备用 CD 时不用旧版 SHA-1 主目录）。
+	const string& strCMSSignBlob = strAltnateCodeDirectorySlot.empty() ? strCodeDirectorySlot : strAltnateCodeDirectorySlot;
+
 	jvalue jvHashes;
 	string strCDHashesPlist;
 	string strCodeDirectorySlotSHA1;
 	string strAltnateCodeDirectorySlot256;
-	ZSHA::SHA1(strCodeDirectorySlot, strCodeDirectorySlotSHA1);
-	ZSHA::SHA256(strAltnateCodeDirectorySlot, strAltnateCodeDirectorySlot256);
-
-	size_t cdHashSize = strCodeDirectorySlotSHA1.size();
-	jvHashes["cdhashes"][0].assign_data(strCodeDirectorySlotSHA1.data(), cdHashSize);
-	jvHashes["cdhashes"][1].assign_data(strAltnateCodeDirectorySlot256.data(), cdHashSize);
+	if (!strAltnateCodeDirectorySlot.empty()) {
+		string strCdHash20Sha1;
+		string strCdHash20Sha256;
+		if (!ComputeCdHash20(strCodeDirectorySlot, false, strCdHash20Sha1) ||
+			!ComputeCdHash20(strAltnateCodeDirectorySlot, true, strCdHash20Sha256) ||
+			!ComputeCdHashFull256(strAltnateCodeDirectorySlot, strAltnateCodeDirectorySlot256)) {
+			return false;
+		}
+		strCodeDirectorySlotSHA1 = strCdHash20Sha1;
+		jvHashes["cdhashes"][0].assign_data(strCdHash20Sha1.data(), 20);
+		jvHashes["cdhashes"][1].assign_data(strCdHash20Sha256.data(), 20);
+	} else {
+		string strCdHash20;
+		if (!ComputeCdHash20(strCMSSignBlob, true, strCdHash20) ||
+			!ComputeCdHashFull256(strCMSSignBlob, strAltnateCodeDirectorySlot256)) {
+			return false;
+		}
+		strCodeDirectorySlotSHA1 = strCdHash20;
+		jvHashes["cdhashes"][0].assign_data(strCdHash20.data(), 20);
+	}
 	jvHashes.style_write_plist(strCDHashesPlist);
 
 	string strCMSData;
-	if (!pSignAsset->GenerateCMS(strCodeDirectorySlot, strCDHashesPlist, strCodeDirectorySlotSHA1, strAltnateCodeDirectorySlot256, strCMSData)) {
+	if (!pSignAsset->GenerateCMS(strCMSSignBlob, strCDHashesPlist, strCodeDirectorySlotSHA1, strAltnateCodeDirectorySlot256, strCMSData)) {
 		return false;
 	}
 
