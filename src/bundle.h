@@ -74,4 +74,5 @@ public:
 	bool		m_bRemoveUISupportedDevices;
 	bool		m_bInjectExtensions;
 	string			m_strAppFolder;
+	string			m_strEntitlementsDir;
 };

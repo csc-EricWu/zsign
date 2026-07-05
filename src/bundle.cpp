@@ -145,7 +145,13 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 			}
 		}
 		if (bMachO) {
-			jvInfo["files"].push_back(strPath.substr(m_strAppFolder.size() + 1));
+			string strRelPath = strPath.substr(m_strAppFolder.size() + 1);
+			// Bundle executables under .app/.appex/.framework/.xctest are signed via SignFolder.
+			if (string::npos != strRelPath.find(".app/") || string::npos != strRelPath.find(".appex/") ||
+				string::npos != strRelPath.find(".framework/") || string::npos != strRelPath.find(".xctest/")) {
+				return false;
+			}
+			jvInfo["files"].push_back(strRelPath);
 		}
 		return false;
 	});
@@ -467,8 +473,26 @@ bool ZBundle::SignNode(jvalue& jvNode)
 		return false;
 	}
 
+	string strSavedEntitlements;
+	if (!m_strEntitlementsDir.empty()) {
+		string strEntitlementsPath = m_strEntitlementsDir + "/" + strBundleId + ".entitlements.plist";
+		string strPerTargetEntitlements;
+		if (ZFile::ReadFile(strEntitlementsPath.c_str(), strPerTargetEntitlements)) {
+			strSavedEntitlements = m_pSignAsset->m_strEntitleData;
+			m_pSignAsset->m_strEntitleData = strPerTargetEntitlements;
+			ZLog::PrintV(">>> Using per-bundle entitlements: %s\n", strEntitlementsPath.c_str());
+		}
+	}
+
 	if (!macho.Sign(m_pSignAsset, bForceSign, strBundleId, strInfoSHA1, strInfoSHA256, strCodeResData)) {
+		if (!strSavedEntitlements.empty()) {
+			m_pSignAsset->m_strEntitleData = strSavedEntitlements;
+		}
 		return false;
+	}
+
+	if (!strSavedEntitlements.empty()) {
+		m_pSignAsset->m_strEntitleData = strSavedEntitlements;
 	}
 
 	return true;
