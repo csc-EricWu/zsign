@@ -55,6 +55,7 @@ const struct option options[] = {
 	{"rm_watch", no_argument, NULL, 'W'},
 	{"rm_uisd", no_argument, NULL, 'U'},
 	{"inject_extensions", no_argument, NULL, 'P'},
+	{"entitlements_dir", required_argument, NULL, 1001},
 	{"help", no_argument, NULL, 'h'},
 	{}
 };
@@ -153,6 +154,7 @@ int usage()
 	ZLog::Print("-W, --rm_watch\t\tRemove watch app from the bundle.\n");
 	ZLog::Print("-U, --rm_uisd\t\tRemove UISupportedDevices from Info.plist.\n");
 	ZLog::Print("-P, --inject_extensions\tAlso inject -l dylibs into app extensions (PlugIns/Extensions).\n");
+	ZLog::Print("--entitlements_dir\tPer-bundle entitlements directory ({bundle_id}.entitlements.plist).\n");
 	ZLog::Print("-v, --version\t\tShows version.\n");
 	ZLog::Print("-h, --help\t\tShows help (this message).\n");
 
@@ -190,6 +192,7 @@ int main(int argc, char* argv[])
 	string strDisplayName;
 	string strEntitleFile;
 	string strIconFile;
+	string strEntitlementsDir;
 	vector<string> arrDylibFiles;
 	vector<string> arrRemoveDylibNames;
 	string strMetadataDir;
@@ -294,6 +297,9 @@ int main(int argc, char* argv[])
 			break;
 		case 'P':
 			bInjectExtensions = true;
+			break;
+		case 1001:
+			strEntitlementsDir = ZFile::GetFullPath(optarg);
 			break;
 		case 'v': {
 			printf("version: %s\n", ZSIGN_VERSION_STR);
@@ -453,6 +459,7 @@ int main(int argc, char* argv[])
 	bundle.m_bRemoveWatchApp = bRemoveWatchApp;
 	bundle.m_bRemoveUISupportedDevices = bRemoveUISupportedDevices;
 	bundle.m_bInjectExtensions = bInjectExtensions;
+	bundle.m_strEntitlementsDir = strEntitlementsDir;
 
 	bool bRet;
 	if (arrProvFiles.size() > 1) {
