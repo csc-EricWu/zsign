@@ -5,11 +5,72 @@
 
 uint64_t ZArchO::s_uExecSegLimit = 0;
 
+// App Store arm64 binaries commonly use 16KB CodeDirectory pages. A hardcoded
+// 4KB page changes nCodeSlots versus codesign and inflates the signature.
+uint8_t ZArchO::InferCodeSignPageLog2(uint8_t* pBase, uint32_t uHeaderSize, uint32_t ncmds, bool b64Bit, bool bBigEndian, uint8_t* pCSBase)
+{
+	auto BO32 = [bBigEndian](uint32_t uVal) -> uint32_t {
+		return bBigEndian ? LE(uVal) : uVal;
+	};
+	(void)b64Bit;
+
+	if (NULL != pCSBase && CSMAGIC_EMBEDDED_SIGNATURE == LE(((CS_SuperBlob*)pCSBase)->magic)) {
+		CS_SuperBlob* psb = (CS_SuperBlob*)pCSBase;
+		CS_BlobIndex* pbi = (CS_BlobIndex*)(pCSBase + sizeof(CS_SuperBlob));
+		for (uint32_t i = 0; i < LE(psb->count); i++, pbi++) {
+			if (CSSLOT_CODEDIRECTORY != LE(pbi->type)) {
+				continue;
+			}
+			uint8_t* pSlot = pCSBase + LE(pbi->offset);
+			if (CSMAGIC_CODEDIRECTORY == LE(((uint32_t*)pSlot)[0])) {
+				CS_CodeDirectory* pcd = (CS_CodeDirectory*)pSlot;
+				if (pcd->pageSize > 0 && pcd->pageSize <= 16) {
+					return pcd->pageSize;
+				}
+			}
+		}
+	}
+
+	bool bAll16KAligned = true;
+	bool bHasSegmentOffset = false;
+	uint8_t* pLoadCommand = pBase + uHeaderSize;
+	for (uint32_t i = 0; i < ncmds; i++) {
+		load_command* plc = (load_command*)pLoadCommand;
+		uint32_t uCmd = BO32(plc->cmd);
+		if (LC_SEGMENT == uCmd) {
+			segment_command* seglc = (segment_command*)pLoadCommand;
+			uint32_t uFileOff = BO32(seglc->fileoff);
+			if (uFileOff > 0) {
+				bHasSegmentOffset = true;
+				if (0 != (uFileOff % 16384)) {
+					bAll16KAligned = false;
+				}
+			}
+		} else if (LC_SEGMENT_64 == uCmd) {
+			segment_command_64* seglc = (segment_command_64*)pLoadCommand;
+			uint64_t uFileOff64 = bBigEndian ? LE(seglc->fileoff) : seglc->fileoff;
+			if (uFileOff64 > 0) {
+				bHasSegmentOffset = true;
+				if (0 != (uFileOff64 % 16384)) {
+					bAll16KAligned = false;
+				}
+			}
+		}
+		pLoadCommand += BO32(plc->cmdsize);
+	}
+
+	if (bHasSegmentOffset && bAll16KAligned) {
+		return 14;
+	}
+	return 12;
+}
+
 ZArchO::ZArchO()
 {
 	m_pBase = NULL;
 	m_uLength = 0;
 	m_uCodeLength = 0;
+	m_uCodeSignPageLog2 = 12;
 	m_pSignBase = NULL;
 	m_uSignLength = 0;
 	m_pHeader = NULL;
@@ -109,6 +170,14 @@ bool ZArchO::Init(uint8_t* pBase, uint32_t uLength)
 
 		pLoadCommand += BO(plc->cmdsize);
 	}
+
+	m_uCodeSignPageLog2 = InferCodeSignPageLog2(
+		m_pBase,
+		m_uHeaderSize,
+		BO(m_pHeader->ncmds),
+		m_b64Bit,
+		m_bBigEndian,
+		m_pSignBase);
 
 	return true;
 }
@@ -421,6 +490,7 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 			strDerEntitlementsSlotSHA1,
 			IsExecute(),
 			pSignAsset->m_bAdhoc,
+			m_uCodeSignPageLog2,
 			strCodeDirectorySlot)) {
 			ZLog::Error(">>> Build SHA1 CodeDirectory failed!\n");
 			return false;
@@ -443,6 +513,7 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 		strDerEntitlementsSlotSHA256,
 		IsExecute(),
 		pSignAsset->m_bAdhoc,
+		m_uCodeSignPageLog2,
 		strAltnateCodeDirectorySlot)) {
 		ZLog::Error(">>> Build SHA256 CodeDirectory failed!\n");
 		return false;
@@ -606,7 +677,25 @@ uint32_t ZArchO::ReallocCodeSignSpace(const string& strNewFile)
 {
 	ZFile::RemoveFile(strNewFile.c_str());
 
-	uint32_t uNewLength = m_uCodeLength + ZUtil::ByteAlign(((m_uCodeLength / 4096) + 1) * (20 + 32), 4096) + 32768; //32K Should Be Enough
+	uint32_t uPageSize = 1u << ((m_uCodeSignPageLog2 > 0 && m_uCodeSignPageLog2 <= 16) ? m_uCodeSignPageLog2 : 12);
+	// Fat slices (WebRTC armv7+arm64) are 16KB-aligned. Growing __LINKEDIT to
+	// only a 4KB boundary makes codesign --verify --strict fail the universal
+	// binary even when each slice verifies on its own.
+	uint32_t uAlign = uPageSize;
+	if (NULL != m_pLinkEditSegment) {
+		load_command* pseglc = (load_command*)m_pLinkEditSegment;
+		uint32_t uVmSize = 0;
+		if (LC_SEGMENT_64 == BO(pseglc->cmd)) {
+			uVmSize = BO((uint32_t)((segment_command_64*)m_pLinkEditSegment)->vmsize);
+		} else if (LC_SEGMENT == BO(pseglc->cmd)) {
+			uVmSize = BO(((segment_command*)m_pLinkEditSegment)->vmsize);
+		}
+		if (uVmSize > 0 && 0 == (uVmSize % 16384)) {
+			uAlign = 16384;
+		}
+	}
+
+	uint32_t uNewLength = m_uCodeLength + ZUtil::ByteAlign(((m_uCodeLength / uPageSize) + 1) * (20 + 32), uAlign) + 32768;
 	if (NULL == m_pLinkEditSegment || uNewLength <= m_uLength) {
 		return 0;
 	}
@@ -616,7 +705,7 @@ uint32_t ZArchO::ReallocCodeSignSpace(const string& strNewFile)
 	case LC_SEGMENT:
 	{
 		segment_command* seglc = (segment_command*)m_pLinkEditSegment;
-		seglc->vmsize = ZUtil::ByteAlign(BO(seglc->vmsize) + (uNewLength - m_uLength), 4096);
+		seglc->vmsize = ZUtil::ByteAlign(BO(seglc->vmsize) + (uNewLength - m_uLength), uAlign);
 		seglc->vmsize = BO(seglc->vmsize);
 		seglc->filesize = uNewLength - BO(seglc->fileoff);
 		seglc->filesize = BO(seglc->filesize);
@@ -625,7 +714,7 @@ uint32_t ZArchO::ReallocCodeSignSpace(const string& strNewFile)
 	case LC_SEGMENT_64:
 	{
 		segment_command_64* seglc = (segment_command_64*)m_pLinkEditSegment;
-		seglc->vmsize = ZUtil::ByteAlign(BO((uint32_t)seglc->vmsize) + (uNewLength - m_uLength), 4096);
+		seglc->vmsize = ZUtil::ByteAlign(BO((uint32_t)seglc->vmsize) + (uNewLength - m_uLength), uAlign);
 		seglc->vmsize = BO((uint32_t)seglc->vmsize);
 		seglc->filesize = uNewLength - BO((uint32_t)seglc->fileoff);
 		seglc->filesize = BO((uint32_t)seglc->filesize);

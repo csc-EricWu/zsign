@@ -462,6 +462,7 @@ bool ZSign::SlotBuildCodeDirectory(bool bAlternate,
 	const string& strDerEntitlementsSlotSHA,
 	bool isExecuteArch,
 	bool isAdhoc,
+	uint8_t uPageSizeLog2,
 	string& strOutput)
 {
 	strOutput.clear();
@@ -485,7 +486,7 @@ bool ZSign::SlotBuildCodeDirectory(bool bAlternate,
 	cdHeader.hashSize = bAlternate ? 32 : 20;
 	cdHeader.hashType = bAlternate ? 2 : 1;
 	cdHeader.spare1 = 0;
-	cdHeader.pageSize = 12;
+	cdHeader.pageSize = (uPageSizeLog2 > 0 && uPageSizeLog2 <= 16) ? uPageSizeLog2 : 12;
 	cdHeader.spare2 = 0;
 	cdHeader.scatterOffset = 0;
 	cdHeader.teamOffset = 0;

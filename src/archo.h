@@ -55,7 +55,12 @@ public:
 	uint32_t		m_uFileType;
 	mach_header*	m_pHeader;
 	uint32_t		m_uHeaderSize;
+	// CodeDirectory pageSize log2 (12 = 4KB, 14 = 16KB).
+	uint8_t			m_uCodeSignPageLog2;
 
 private:
 	static uint64_t s_uExecSegLimit;
+	// Prefer the existing CodeDirectory page size; otherwise 16KB when every
+	// nonzero segment fileoff is 16KB-aligned.
+	static uint8_t InferCodeSignPageLog2(uint8_t* pBase, uint32_t uHeaderSize, uint32_t ncmds, bool b64Bit, bool bBigEndian, uint8_t* pCSBase);
 };
